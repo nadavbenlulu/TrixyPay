@@ -3,6 +3,7 @@ const cors = require('cors');
 const express = require('express');
 const helmet = require('helmet');
 const mongoose = require('mongoose');
+const path = require('path');
 const rateLimit = require('express-rate-limit');
 const {
   allowedOrigins,
@@ -17,19 +18,33 @@ const profileRoutes = require('./routes/profile');
 
 const app = express();
 
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(helmet());
-app.use(
-  cors({
+app.use((req, res, next) => {
+  const corsMiddleware = cors({
     credentials: true,
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
+      let isSameOrigin = false;
+      if (origin) {
+        try {
+          const parsedOrigin = new URL(origin);
+          isSameOrigin =
+            parsedOrigin.host === req.get('host')
+            && parsedOrigin.protocol === `${req.protocol}:`;
+        } catch {
+          isSameOrigin = false;
+        }
+      }
+
+      if (!origin || isSameOrigin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
       return callback(new Error('Origin is not allowed by CORS.'));
     },
-  }),
-);
+  });
+  return corsMiddleware(req, res, next);
+});
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
@@ -54,6 +69,7 @@ app.use(
 app.use('/api/partners', partnerRoutes);
 app.use('/api/purchases', purchaseRoutes);
 app.use('/api/profile', profileRoutes);
+app.use(express.static(path.resolve(__dirname, '../../mobile/dist')));
 
 app.use((error, req, res, next) => {
   if (res.headersSent) {

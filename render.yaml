@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: trixpay
+    runtime: node
+    plan: free
+    buildCommand: npm ci --prefix mobile && EXPO_PUBLIC_API_URL=/api npm run build:web --prefix mobile && npm ci --prefix backend
+    startCommand: npm start --prefix backend
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: BANK_DETAILS_ENCRYPTION_KEY
+        sync: false

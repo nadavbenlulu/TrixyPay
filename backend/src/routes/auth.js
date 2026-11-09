@@ -7,6 +7,7 @@ const { jwtSecret, nodeEnv, cookieSameSite } = require('../config');
 
 const router = express.Router();
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const usernamePattern = /^[a-zA-Z0-9._-]{3,30}$/;
 const cookieName = 'trixpay_session';
 const cookieOptions = {
   httpOnly: true,
@@ -22,23 +23,54 @@ function publicUser(user) {
     contactName: user.contactName,
     businessName: user.businessName,
     role: user.role,
+    username: user.username || '',
     email: user.email,
   };
 }
 
 function validateCredentials(body, includeProfile) {
-  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const password = typeof body.password === 'string' ? body.password : '';
 
-  if (!emailPattern.test(email) || email.length > 254) {
-    return { error: 'יש להזין כתובת דוא״ל תקינה.' };
-  }
   if (password.length < 10 || password.length > 72) {
     return { error: 'הסיסמה צריכה להכיל בין 10 ל־72 תווים.' };
   }
 
   if (!includeProfile) {
-    return { email, password };
+    const identifier =
+      typeof body.identifier === 'string'
+        ? body.identifier.trim()
+        : typeof body.username === 'string'
+          ? body.username.trim()
+          : typeof body.email === 'string'
+            ? body.email.trim()
+            : '';
+
+    if (
+      !identifier ||
+      identifier.length > 254 ||
+      (!emailPattern.test(identifier) && !usernamePattern.test(identifier))
+    ) {
+      return { error: 'יש להזין שם משתמש או כתובת דוא״ל תקינים.' };
+    }
+
+    return {
+      identifier: emailPattern.test(identifier)
+        ? identifier.toLowerCase()
+        : identifier.toLowerCase(),
+      isEmail: emailPattern.test(identifier),
+      password,
+    };
+  }
+
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const username =
+    typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
+
+  if (!emailPattern.test(email) || email.length > 254) {
+    return { error: 'יש להזין כתובת דוא״ל תקינה.' };
+  }
+  if (!usernamePattern.test(username)) {
+    return { error: 'שם המשתמש חייב להכיל 3–30 תווים באנגלית, מספרים, נקודה, מקף או קו תחתון.' };
   }
 
   const contactName =
@@ -57,7 +89,7 @@ function validateCredentials(body, includeProfile) {
     return { error: 'יש לבחור סוג חשבון.' };
   }
 
-  return { email, password, contactName, businessName, role };
+  return { username, email, password, contactName, businessName, role };
 }
 
 function issueSession(req, res, user, statusCode = 200) {
@@ -86,6 +118,7 @@ router.post('/register', async (req, res, next) => {
       contactName: details.contactName,
       businessName: details.businessName,
       role: details.role,
+      username: details.username,
       email: details.email,
       passwordHash,
     });
@@ -93,6 +126,9 @@ router.post('/register', async (req, res, next) => {
     return issueSession(req, res, user, 201);
   } catch (error) {
     if (error.code === 11000) {
+      if (error.keyPattern && error.keyPattern.username) {
+        return res.status(409).json({ message: 'שם המשתמש הזה כבר תפוס.' });
+      }
       return res.status(409).json({ message: 'כבר קיים חשבון עם כתובת הדוא״ל הזו.' });
     }
     return next(error);
@@ -106,12 +142,16 @@ router.post('/login', async (req, res, next) => {
   }
 
   try {
-    const user = await User.findOne({ email: details.email }).select('+passwordHash');
+    const user = await User.findOne(
+      details.isEmail
+        ? { email: details.identifier }
+        : { username: details.identifier },
+    ).select('+passwordHash');
     const passwordMatches =
       user && (await bcrypt.compare(details.password, user.passwordHash));
 
     if (!passwordMatches) {
-      return res.status(401).json({ message: 'כתובת הדוא״ל או הסיסמה אינן נכונות.' });
+      return res.status(401).json({ message: 'שם המשתמש או הסיסמה אינם נכונים.' });
     }
 
     return issueSession(req, res, user);

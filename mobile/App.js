@@ -36,7 +36,9 @@ const colors = {
 const inputFields = [
   { key: 'contactName', label: 'שם מלא', placeholder: 'איך לפנות אליך?' },
   { key: 'businessName', label: 'שם העסק', placeholder: 'לדוגמה: קפה השדרה' },
+  { key: 'username', label: 'שם משתמש', placeholder: '3–30 תווים באנגלית' },
   { key: 'email', label: 'דוא״ל', placeholder: 'name@example.com', keyboardType: 'email-address' },
+  { key: 'identifier', label: 'שם משתמש או דוא״ל', placeholder: 'שם משתמש או name@example.com' },
   { key: 'password', label: 'סיסמה', placeholder: 'לפחות 10 תווים', secureTextEntry: true },
   { key: 'confirmPassword', label: 'אימות סיסמה', placeholder: 'הקלד/י שוב את הסיסמה', secureTextEntry: true },
 ];
@@ -925,7 +927,9 @@ export default function App() {
   const [form, setForm] = useState({
     contactName: '',
     businessName: '',
+    username: '',
     email: '',
+    identifier: '',
     password: '',
     confirmPassword: '',
     role: 'business',
@@ -996,6 +1000,10 @@ export default function App() {
         setError('יש למלא שם מלא ושם עסק.');
         return;
       }
+      if (!/^[a-zA-Z0-9._-]{3,30}$/.test(form.username.trim())) {
+        setError('שם המשתמש חייב להכיל 3–30 תווים באנגלית, מספרים, נקודה, מקף או קו תחתון.');
+        return;
+      }
     }
     if (form.password.length < 10) {
       setError('הסיסמה צריכה להכיל לפחות 10 תווים.');
@@ -1011,10 +1019,11 @@ export default function App() {
               contactName: form.contactName.trim(),
               businessName: form.businessName.trim(),
               role: form.role,
+              username: form.username.trim(),
               email: form.email.trim(),
               password: form.password,
             }
-          : { email: form.email.trim(), password: form.password };
+          : { identifier: form.identifier.trim(), password: form.password };
       const result = await apiRequest(path, {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -1150,16 +1159,22 @@ export default function App() {
                   ) : null}
 
                   {inputFields
-                    .filter((field) => mode === 'register' || !['contactName', 'businessName', 'confirmPassword'].includes(field.key))
+                    .filter((field) =>
+                      mode === 'register'
+                        ? field.key !== 'identifier'
+                        : ['identifier', 'password'].includes(field.key),
+                    )
                     .map((field) => (
                       <View key={field.key} style={styles.field}>
                         <Text style={styles.fieldLabel}>{field.label}</Text>
                         <TextInput
                           accessibilityLabel={field.label}
-                          autoCapitalize={field.key === 'email' ? 'none' : 'words'}
+                          autoCapitalize={['email', 'username', 'identifier'].includes(field.key) ? 'none' : 'words'}
                           autoComplete={
-                            field.key === 'email'
-                              ? 'email'
+                            field.key === 'email' || field.key === 'identifier'
+                              ? field.key === 'email' ? 'email' : 'username'
+                              : field.key === 'username'
+                                ? 'username'
                               : field.key === 'password'
                                 ? mode === 'register' ? 'new-password' : 'password'
                                 : 'name'

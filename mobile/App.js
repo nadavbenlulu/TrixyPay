@@ -1584,7 +1584,7 @@ const styles = StyleSheet.create({
   mobileContent: { flexDirection: 'column', gap: 18, width: '100%' },
   dashboard: { width: '100%', gap: 18 },
   dashboardHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: colors.navy, borderRadius: 20, paddingHorizontal: 22, paddingVertical: 20 },
-  dashboardIdentity: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
+  dashboardIdentity: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 12, flex: 1 },
   dashboardGreetingBlock: { alignItems: 'flex-end' },
   dashboardGreeting: { color: colors.white, fontSize: 20, fontWeight: '800', textAlign: 'right' },
   dashboardBusiness: { color: '#B7C9D3', fontSize: 13, marginTop: 5, textAlign: 'right' },

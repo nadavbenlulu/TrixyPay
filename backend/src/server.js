@@ -30,8 +30,8 @@ app.use((req, res, next) => {
         try {
           const parsedOrigin = new URL(origin);
           isSameOrigin =
-            parsedOrigin.host === req.get('host')
-            && parsedOrigin.protocol === `${req.protocol}:`;
+            parsedOrigin.host === req.get('host') &&
+            parsedOrigin.protocol === `${req.protocol}:`;
         } catch {
           isSameOrigin = false;
         }
@@ -85,8 +85,7 @@ app.use((error, req, res, next) => {
 });
 
 async function start() {
-  console.log('MONGODB_URI is configured:', Boolean(mongoUri));
-  await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 });
+  await mongoose.connect(mongoUri);
   app.listen(port, '0.0.0.0', () => {
     console.log(`TrixPay API listening on port ${port}`);
   });

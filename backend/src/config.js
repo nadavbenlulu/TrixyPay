@@ -9,12 +9,12 @@ for (const name of required) {
   }
 }
 
-if (!/^[\da-fA-F]{64}$/.test(process.env.BANK_DETAILS_ENCRYPTION_KEY || '')) {
-  throw new Error('BANK_DETAILS_ENCRYPTION_KEY must be a 32-byte hexadecimal key.');
-}
-
 if (process.env.JWT_SECRET.length < 32) {
   throw new Error('JWT_SECRET must be at least 32 characters long.');
+}
+
+if (!/^[\da-fA-F]{64}$/.test(process.env.BANK_DETAILS_ENCRYPTION_KEY || '')) {
+  throw new Error('BANK_DETAILS_ENCRYPTION_KEY must be a 32-byte hexadecimal key.');
 }
 
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:8081')

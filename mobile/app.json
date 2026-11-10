@@ -29,6 +29,12 @@
           "photosPermission": "TrixPay משתמשת בתמונות שתבחרו עבור תמונת הפרופיל.",
           "microphonePermission": false
         }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "TrixPay משתמשת ב־Face ID כדי לאפשר התחברות מאובטחת לחשבון."
+        }
       ]
     ]
   }

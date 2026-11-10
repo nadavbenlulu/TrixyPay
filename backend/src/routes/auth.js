@@ -1,9 +1,20 @@
 const bcrypt = require('bcryptjs');
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} = require('@simplewebauthn/server');
 const User = require('../models/User');
 const authenticate = require('../middleware/authenticate');
-const { jwtSecret, nodeEnv, cookieSameSite } = require('../config');
+const {
+  allowedOrigins,
+  jwtSecret,
+  nodeEnv,
+  cookieSameSite,
+} = require('../config');
 
 const router = express.Router();
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -16,6 +27,71 @@ const cookieOptions = {
   path: '/',
   maxAge: 7 * 24 * 60 * 60 * 1000,
 };
+const passkeyChallengeLifetimeMs = 5 * 60 * 1000;
+
+function passkeyOrigin(req) {
+  const origin = req.get('origin');
+  const host = req.get('host');
+  if (!origin || !host) {
+    return null;
+  }
+
+  try {
+    const parsedOrigin = new URL(origin);
+    const isSecure =
+      parsedOrigin.protocol === 'https:' || parsedOrigin.hostname === 'localhost';
+    const isSameOrigin =
+      parsedOrigin.host.toLowerCase() === host.toLowerCase() &&
+      parsedOrigin.protocol === `${req.protocol}:`;
+    if (
+      parsedOrigin.origin !== origin ||
+      !isSecure ||
+      (!isSameOrigin && !allowedOrigins.includes(parsedOrigin.origin))
+    ) {
+      return null;
+    }
+
+    return { origin: parsedOrigin.origin, rpID: parsedOrigin.hostname };
+  } catch {
+    return null;
+  }
+}
+
+function accountQuery(identifier) {
+  if (
+    typeof identifier !== 'string' ||
+    identifier.length > 254 ||
+    (!emailPattern.test(identifier) && !usernamePattern.test(identifier))
+  ) {
+    return null;
+  }
+  const normalized = identifier.trim().toLowerCase();
+  return emailPattern.test(normalized)
+    ? { email: normalized }
+    : { username: normalized };
+}
+
+function pendingPasskeyChallenge(userId, challengeType) {
+  return User.findOneAndUpdate(
+    {
+      _id: userId,
+      passkeyChallengeType: challengeType,
+      passkeyChallengeCreatedAt: {
+        $gte: new Date(Date.now() - passkeyChallengeLifetimeMs),
+      },
+    },
+    {
+      $unset: {
+        passkeyChallenge: 1,
+        passkeyChallengeType: 1,
+        passkeyChallengeCreatedAt: 1,
+      },
+    },
+    { new: false },
+  ).select(
+    '+passkeys +passkeyChallenge +passkeyChallengeType +passkeyChallengeCreatedAt',
+  );
+}
 
 function publicUser(user) {
   return {
@@ -25,6 +101,7 @@ function publicUser(user) {
     role: user.role,
     username: user.username || '',
     email: user.email,
+    profileImage: user.profileImage || '',
   };
 }
 
@@ -153,6 +230,208 @@ router.post('/login', async (req, res, next) => {
     if (!passwordMatches) {
       return res.status(401).json({ message: 'שם המשתמש או הסיסמה אינם נכונים.' });
     }
+
+    return issueSession(req, res, user);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/passkey/register/options', authenticate, async (req, res, next) => {
+  const relyingParty = passkeyOrigin(req);
+  if (!relyingParty) {
+    return res.status(403).json({ message: 'לא ניתן להגדיר Passkey מהמקור הזה.' });
+  }
+
+  try {
+    const user = await User.findById(req.userId).select('+passkeys');
+    if (!user) {
+      return res.status(401).json({ message: 'החשבון לא נמצא. יש להתחבר מחדש.' });
+    }
+
+    const options = await generateRegistrationOptions({
+      rpName: 'TrixPay',
+      rpID: relyingParty.rpID,
+      userID: new Uint8Array(Buffer.from(user.id, 'utf8')),
+      userName: user.username || user.email,
+      userDisplayName: user.contactName,
+      attestationType: 'none',
+      excludeCredentials: user.passkeys.map((passkey) => ({
+        id: passkey.id,
+        transports: passkey.transports,
+      })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'required',
+      },
+    });
+
+    user.passkeyChallenge = options.challenge;
+    user.passkeyChallengeType = 'registration';
+    user.passkeyChallengeCreatedAt = new Date();
+    await user.save();
+
+    return res.json(options);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/passkey/register/verify', authenticate, async (req, res, next) => {
+  const relyingParty = passkeyOrigin(req);
+  if (!relyingParty) {
+    return res.status(403).json({ message: 'לא ניתן להגדיר Passkey מהמקור הזה.' });
+  }
+
+  try {
+    const user = await pendingPasskeyChallenge(req.userId, 'registration');
+    if (!user) {
+      return res.status(400).json({ message: 'פג תוקף הבקשה. יש לנסות שוב.' });
+    }
+
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: req.body,
+        expectedChallenge: user.passkeyChallenge,
+        expectedOrigin: relyingParty.origin,
+        expectedRPID: relyingParty.rpID,
+        requireUserVerification: true,
+      });
+    } catch {
+      return res.status(400).json({ message: 'לא ניתן לאמת את ה־Passkey. יש לנסות שוב.' });
+    }
+
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ message: 'לא ניתן לאמת את ה־Passkey. יש לנסות שוב.' });
+    }
+
+    const { credential, credentialDeviceType, credentialBackedUp } =
+      verification.registrationInfo;
+    if (user.passkeys.some((passkey) => passkey.id === credential.id)) {
+      return res.status(409).json({ message: 'ה־Passkey הזה כבר מחובר לחשבון.' });
+    }
+
+    user.passkeyChallenge = undefined;
+    user.passkeyChallengeType = undefined;
+    user.passkeyChallengeCreatedAt = undefined;
+    user.passkeys.push({
+      id: credential.id,
+      publicKey: Buffer.from(credential.publicKey),
+      counter: credential.counter,
+      transports: credential.transports || [],
+      deviceType: credentialDeviceType,
+      backedUp: credentialBackedUp,
+    });
+    await user.save();
+
+    return res.json({ verified: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/passkey/login/options', async (req, res, next) => {
+  const identifier = typeof req.body?.identifier === 'string'
+    ? req.body.identifier.trim().toLowerCase()
+    : '';
+  const query = accountQuery(identifier);
+  if (!query) {
+    return res.status(400).json({ message: 'יש להזין שם משתמש או כתובת דוא״ל תקינים.' });
+  }
+
+  const relyingParty = passkeyOrigin(req);
+  if (!relyingParty) {
+    return res.status(403).json({ message: 'לא ניתן להתחבר באמצעות Passkey מהמקור הזה.' });
+  }
+
+  try {
+    const user = await User.findOne(query).select('+passkeys');
+    if (!user || user.passkeys.length === 0) {
+      return res.status(400).json({
+        message: 'לא נמצא Passkey לחשבון הזה. אפשר להתחבר עם שם משתמש וסיסמה.',
+      });
+    }
+
+    const options = await generateAuthenticationOptions({
+      rpID: relyingParty.rpID,
+      allowCredentials: user.passkeys.map((passkey) => ({
+        id: passkey.id,
+        transports: passkey.transports,
+      })),
+      userVerification: 'required',
+    });
+
+    user.passkeyChallenge = options.challenge;
+    user.passkeyChallengeType = 'authentication';
+    user.passkeyChallengeCreatedAt = new Date();
+    await user.save();
+
+    return res.json(options);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/passkey/login/verify', async (req, res, next) => {
+  const identifier = typeof req.body?.identifier === 'string'
+    ? req.body.identifier.trim().toLowerCase()
+    : '';
+  const query = accountQuery(identifier);
+  if (!query || typeof req.body?.response?.id !== 'string') {
+    return res.status(400).json({ message: 'בקשת ההתחברות אינה תקינה.' });
+  }
+
+  const relyingParty = passkeyOrigin(req);
+  if (!relyingParty) {
+    return res.status(403).json({ message: 'לא ניתן להתחבר באמצעות Passkey מהמקור הזה.' });
+  }
+
+  try {
+    const account = await User.findOne(query).select('+passkeys');
+    if (!account) {
+      return res.status(401).json({ message: 'לא ניתן לאמת את פרטי ה־Passkey.' });
+    }
+    const user = await pendingPasskeyChallenge(account.id, 'authentication');
+    if (!user) {
+      return res.status(400).json({ message: 'פג תוקף הבקשה. יש לנסות שוב.' });
+    }
+
+    const passkey = user.passkeys.find(
+      (candidate) => candidate.id === req.body.response.id,
+    );
+    if (!passkey) {
+      return res.status(401).json({ message: 'לא ניתן לאמת את פרטי ה־Passkey.' });
+    }
+
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: req.body.response,
+        expectedChallenge: user.passkeyChallenge,
+        expectedOrigin: relyingParty.origin,
+        expectedRPID: relyingParty.rpID,
+        credential: {
+          id: passkey.id,
+          publicKey: new Uint8Array(passkey.publicKey),
+          counter: passkey.counter,
+          transports: passkey.transports,
+        },
+        requireUserVerification: true,
+      });
+    } catch {
+      return res.status(401).json({ message: 'לא ניתן לאמת את פרטי ה־Passkey.' });
+    }
+
+    if (!verification.verified) {
+      return res.status(401).json({ message: 'לא ניתן לאמת את פרטי ה־Passkey.' });
+    }
+
+    passkey.counter = verification.authenticationInfo.newCounter;
+    user.passkeyChallenge = undefined;
+    user.passkeyChallengeType = undefined;
+    user.passkeyChallengeCreatedAt = undefined;
+    await user.save();
 
     return issueSession(req, res, user);
   } catch (error) {

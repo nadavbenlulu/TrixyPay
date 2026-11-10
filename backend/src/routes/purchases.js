@@ -17,6 +17,52 @@ function parseDate(value, label) {
   return Number.isNaN(date.getTime()) ? { error: `תאריך ${label} אינו תקין.` } : date;
 }
 
+router.get('/summary', async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(401).json({ message: 'החשבון לא נמצא. יש להתחבר מחדש.' });
+    }
+
+    const [summary] = await Purchase.aggregate([
+      {
+        $match: user.role === 'business'
+          ? { businessId: user._id }
+          : { supplierId: user._id },
+      },
+      {
+        $group: {
+          _id: null,
+          totalAmount: { $sum: '$totalAmount' },
+          paidAmount: {
+            $sum: {
+              $cond: [{ $eq: ['$paymentStatus', 'paid'] }, '$totalAmount', 0],
+            },
+          },
+          openAmount: {
+            $sum: {
+              $cond: [{ $ne: ['$paymentStatus', 'paid'] }, '$totalAmount', 0],
+            },
+          },
+          purchaseCount: { $sum: 1 },
+        },
+      },
+      { $project: { _id: 0, totalAmount: 1, paidAmount: 1, openAmount: 1, purchaseCount: 1 } },
+    ]);
+
+    return res.json({
+      summary: summary || {
+        totalAmount: 0,
+        paidAmount: 0,
+        openAmount: 0,
+        purchaseCount: 0,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get('/', async (req, res, next) => {
   const from = parseDate(req.query.from, 'התחלה');
   const to = parseDate(req.query.to, 'סיום');

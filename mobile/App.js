@@ -17,8 +17,12 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import {
   apiRequest,
+  authenticateBiometricLogin,
   clearAccessToken,
+  disableBiometricLogin,
+  enableBiometricLogin,
   hasAccessToken,
+  isBiometricLoginEnabled,
   saveAccessToken,
 } from './src/api';
 
@@ -183,7 +187,10 @@ function ProfileSettings({ user, onProfileUpdated }) {
       setAccountNumber('');
       setAccountHolder('');
       setCanEditBusinessName(false);
-      onProfileUpdated(result.profile.businessName);
+      onProfileUpdated({
+        businessName: result.profile.businessName,
+        profileImage: result.profile.profileImage,
+      });
       setNotice('הפרופיל נשמר בהצלחה.');
     } catch (requestError) {
       setError(requestError.message);
@@ -210,8 +217,12 @@ function ProfileSettings({ user, onProfileUpdated }) {
   return (
     <View style={styles.profileContent}>
       <View style={styles.profileHeading}>
-        <Text style={styles.panelTitle}>הפרופיל והגדרות העסק</Text>
-        <Text style={styles.cardSubtitle}>ניהול פרטי העסק, תמונת החשבון ופרטי חשבון בנק.</Text>
+        <Text style={styles.panelTitle}>
+          {user.role === 'business' ? 'פרופיל והגדרות העסק' : 'פרופיל הספק'}
+        </Text>
+        <Text style={styles.cardSubtitle}>
+          ניהול פרטי החשבון, תמונת הפרופיל ופרטי חשבון הבנק.
+        </Text>
       </View>
       {error ? <Text accessibilityRole="alert" style={styles.errorText}>{error}</Text> : null}
       {notice ? <Text style={styles.noticeText}>{notice}</Text> : null}
@@ -404,13 +415,27 @@ function ProfileSettings({ user, onProfileUpdated }) {
   );
 }
 
-function Dashboard({ user, busy, onLogout, onProfileUpdated }) {
+function Dashboard({
+  user,
+  busy,
+  biometricEnabled,
+  onBiometricLoginChanged,
+  onLogout,
+  onProfileUpdated,
+}) {
   const [partners, setPartners] = useState([]);
   const [purchases, setPurchases] = useState([]);
+  const [purchaseSummary, setPurchaseSummary] = useState({
+    totalAmount: 0,
+    paidAmount: 0,
+    openAmount: 0,
+    purchaseCount: 0,
+  });
   const [period, setPeriod] = useState('30d');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
   const [view, setView] = useState('overview');
+  const [menuOpen, setMenuOpen] = useState(false);
   const [supplierEmail, setSupplierEmail] = useState('');
   const [selectedSupplierId, setSelectedSupplierId] = useState('');
   const [purchaseItems, setPurchaseItems] = useState([]);
@@ -434,30 +459,13 @@ function Dashboard({ user, busy, onLogout, onProfileUpdated }) {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams();
-      if (period === 'custom') {
-        const from = new Date(`${customFrom}T00:00:00`);
-        const to = new Date(`${customTo}T23:59:59.999`);
-        params.set('from', from.toISOString());
-        params.set('to', to.toISOString());
-      } else if (period !== 'all') {
-        const from = new Date();
-        if (period === 'today') {
-          from.setHours(0, 0, 0, 0);
-        } else {
-          from.setDate(from.getDate() - (period === '7d' ? 7 : 30));
-          from.setHours(0, 0, 0, 0);
-        }
-        params.set('from', from.toISOString());
-      }
-      const query = params.toString();
-      const purchasePath = `/purchases${query ? `?${query}` : ''}`;
-      const requests = [apiRequest(purchasePath)];
-      if (isBusiness) {
-        requests.push(apiRequest('/partners'));
-      }
-      const [purchaseResult, partnerResult] = await Promise.all(requests);
+      const [purchaseResult, summaryResult, partnerResult] = await Promise.all([
+        apiRequest('/purchases'),
+        apiRequest('/purchases/summary'),
+        isBusiness ? apiRequest('/partners') : Promise.resolve(null),
+      ]);
       setPurchases(purchaseResult.purchases);
+      setPurchaseSummary(summaryResult.summary);
       if (partnerResult) {
         const availablePartners = partnerResult.partners;
         setPartners(availablePartners);
@@ -472,7 +480,7 @@ function Dashboard({ user, busy, onLogout, onProfileUpdated }) {
     } finally {
       setLoading(false);
     }
-  }, [customFrom, customTo, isBusiness, period]);
+  }, [isBusiness]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -602,61 +610,317 @@ function Dashboard({ user, busy, onLogout, onProfileUpdated }) {
     }
   }
 
-  const total = purchases.reduce((sum, purchase) => sum + purchase.totalAmount, 0);
-  const paid = purchases
-    .filter((purchase) => purchase.paymentStatus === 'paid')
-    .reduce((sum, purchase) => sum + purchase.totalAmount, 0);
-  const unpaid = purchases
-    .filter((purchase) => purchase.paymentStatus !== 'paid')
-    .reduce((sum, purchase) => sum + purchase.totalAmount, 0);
+  async function configureBiometricLogin() {
+    setError('');
+    setNotice('');
+    setSaving(true);
+    try {
+      if (biometricEnabled) {
+        await disableBiometricLogin();
+        onBiometricLoginChanged(false);
+        setNotice('ההתחברות הביומטרית כובתה במכשיר הזה.');
+      } else {
+        const result = await enableBiometricLogin();
+        if (result.enabled) {
+          onBiometricLoginChanged(true);
+          setNotice('ההתחברות הביומטרית הופעלה במכשיר הזה.');
+        } else if (result.cancelled) {
+          setNotice('הפעלת ההתחברות הביומטרית בוטלה.');
+        } else {
+          setError(result.message);
+        }
+      }
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function registerPasskey() {
+    setError('');
+    setNotice('');
+    setSaving(true);
+    try {
+      const options = await apiRequest('/auth/passkey/register/options', {
+        method: 'POST',
+      });
+      const { startRegistration } = await import('@simplewebauthn/browser');
+      const response = await startRegistration({ optionsJSON: options });
+      await apiRequest('/auth/passkey/register/verify', {
+        method: 'POST',
+        body: JSON.stringify(response),
+      });
+      setNotice('ה־Passkey הוגדר. בפעם הבאה אפשר להתחבר באמצעות זיהוי המכשיר.');
+    } catch (requestError) {
+      setError(
+        requestError.name === 'NotAllowedError'
+          ? 'הגדרת ה־Passkey בוטלה או לא הושלמה.'
+          : requestError.message,
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
 
   function purchasePartnerName(purchase) {
     const partner = isBusiness ? purchase.supplierId : purchase.businessId;
     return partner?.businessName || 'עסק';
   }
 
+  function filterPurchasesByPeriod() {
+    if (period === 'all') {
+      return purchases;
+    }
+
+    let from;
+    let to;
+    if (period === 'custom') {
+      const parseCalendarDate = (value) => {
+        const [year, month, day] = value.split('-').map(Number);
+        const date = new Date(year, month - 1, day);
+        return date.getFullYear() === year &&
+          date.getMonth() === month - 1 &&
+          date.getDate() === day
+          ? date
+          : null;
+      };
+      from = parseCalendarDate(customFrom);
+      to = parseCalendarDate(customTo);
+      if (!from || !to) {
+        return [];
+      }
+      to.setHours(23, 59, 59, 999);
+    } else {
+      from = new Date();
+      from.setHours(0, 0, 0, 0);
+      if (period === '7d') {
+        from.setDate(from.getDate() - 7);
+      } else if (period === '30d') {
+        from.setDate(from.getDate() - 30);
+      }
+    }
+
+    return purchases.filter((purchase) => {
+      const createdAt = new Date(purchase.createdAt);
+      return createdAt >= from && (!to || createdAt <= to);
+    });
+  }
+
+  const historyPurchases = filterPurchasesByPeriod();
+  const visiblePurchases = view === 'history' ? historyPurchases : purchases.slice(0, 5);
+  const dashboardMenuItems = [
+    { key: 'overview', label: 'סקירה כללית' },
+    { key: 'history', label: isBusiness ? 'היסטוריית רכישות' : 'היסטוריית מכירות' },
+    ...(isBusiness
+      ? [
+          { key: 'supplier', label: 'הוספת ספק' },
+          { key: 'purchase', label: 'רכישה חדשה' },
+        ]
+      : []),
+    { key: 'profile', label: 'פרופיל והגדרות' },
+    { key: 'security', label: 'התחברות ואבטחה' },
+  ];
+  const purchaseList = loading ? (
+    <ActivityIndicator color={colors.teal} style={styles.listLoader} />
+  ) : visiblePurchases.length ? visiblePurchases.map((purchase) => (
+    <View key={purchase._id} style={styles.purchaseRow}>
+      <View style={styles.purchaseSummary}>
+        <Text style={styles.purchaseName}>{purchasePartnerName(purchase)}</Text>
+        <Text style={styles.purchaseMeta}>
+          {purchase.items.map((item) => item.name).join(', ')} · {new Date(purchase.createdAt).toLocaleDateString('he-IL')}
+        </Text>
+        <Text style={styles.purchaseMeta}>
+          {purchase.paymentMethod === 'cash' ? 'חשבון פתוח' : purchase.paymentMethod === 'check' ? 'צ׳ק' : 'אשראי'}
+          {' · '}
+          {purchase.paymentStatus === 'paid' ? 'שולם' : purchase.paymentStatus === 'open' ? 'פתוח' : 'ממתין לתשלום'}
+        </Text>
+      </View>
+      <View style={styles.purchaseAmount}>
+        <Text style={styles.purchaseValue}>{amount(purchase.totalAmount)}</Text>
+        {isBusiness && purchase.paymentStatus !== 'paid' ? (
+          <Pressable
+            accessibilityRole="button"
+            disabled={saving}
+            onPress={() => markPaid(purchase._id)}
+          >
+            <Text style={styles.markPaidText}>סימון כשולם</Text>
+          </Pressable>
+        ) : null}
+      </View>
+    </View>
+  )) : (
+    <Text style={styles.emptyState}>
+      {isBusiness
+        ? 'אין רכישות להצגה בתקופה שנבחרה.'
+        : 'אין עסקאות להצגה בתקופה שנבחרה.'}
+    </Text>
+  );
+
   return (
     <View style={styles.dashboard}>
       <View style={styles.dashboardHeader}>
-        <View>
-          <Text style={styles.dashboardGreeting}>
-            {isBusiness ? 'שלום' : 'אזור הספק'}, {user.contactName}
-          </Text>
-          <Text style={styles.dashboardBusiness}>{user.businessName}</Text>
+        <View style={styles.dashboardIdentity}>
+          <View style={styles.dashboardGreetingBlock}>
+            <Text style={styles.dashboardGreeting}>
+              שלום, {user.contactName}
+            </Text>
+            <Text style={styles.dashboardBusiness}>{user.businessName}</Text>
+          </View>
+          <View style={styles.dashboardAvatar}>
+            {user.profileImage ? (
+              <Image source={{ uri: user.profileImage }} style={styles.dashboardAvatarImage} />
+            ) : (
+              <Text style={styles.dashboardAvatarFallback}>
+                {user.contactName?.[0] || 'T'}
+              </Text>
+            )}
+          </View>
         </View>
-        <Pressable accessibilityRole="button" onPress={onLogout} disabled={busy}>
-          <Text style={styles.logoutText}>{busy ? '...' : 'התנתקות'}</Text>
-        </Pressable>
+        <View style={styles.dashboardHeaderActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="פתיחת תפריט ניווט"
+            accessibilityState={{ expanded: menuOpen }}
+            onPress={() => setMenuOpen(true)}
+            style={styles.menuButton}
+          >
+            <Text style={styles.menuButtonIcon}>☰</Text>
+          </Pressable>
+          <Pressable accessibilityRole="button" onPress={onLogout} disabled={busy}>
+            <Text style={styles.logoutText}>{busy ? '...' : 'התנתקות'}</Text>
+          </Pressable>
+        </View>
       </View>
 
-      <View style={styles.dashboardNav}>
-        {[
-          { key: 'overview', label: 'סקירה' },
-          ...(isBusiness ? [{ key: 'supplier', label: 'הוספת ספק' }, { key: 'purchase', label: 'רכישה חדשה' }] : []),
-          { key: 'profile', label: 'פרופיל והגדרות' },
-        ].map((item) => (
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setMenuOpen(false)}
+        transparent
+        visible={menuOpen}
+      >
+        <View style={styles.menuOverlay}>
           <Pressable
-            key={item.key}
-            accessibilityRole="tab"
-            accessibilityState={{ selected: view === item.key }}
-            onPress={() => { setView(item.key); setError(''); setNotice(''); }}
-            style={[styles.dashboardNavItem, view === item.key && styles.dashboardNavItemActive]}
-          >
-            <Text style={[styles.dashboardNavText, view === item.key && styles.dashboardNavTextActive]}>
-              {item.label}
+            accessibilityRole="button"
+            accessibilityLabel="סגירת תפריט"
+            onPress={() => setMenuOpen(false)}
+            style={styles.menuScrim}
+          />
+          <View accessibilityViewIsModal style={styles.menuDrawer}>
+            <View style={styles.menuHeader}>
+              <Text style={styles.menuTitle}>תפריט</Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="סגירה"
+                onPress={() => setMenuOpen(false)}
+                style={styles.menuCloseButton}
+              >
+                <Text style={styles.menuCloseText}>×</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.menuAccountName}>
+              {isBusiness ? 'ניהול העסק' : 'אזור הספק'}
             </Text>
-          </Pressable>
-        ))}
-      </View>
+            {dashboardMenuItems.map((item) => (
+              <Pressable
+                key={item.key}
+                accessibilityRole="button"
+                accessibilityState={{ selected: view === item.key }}
+                onPress={() => {
+                  setView(item.key);
+                  setMenuOpen(false);
+                  setError('');
+                  setNotice('');
+                }}
+                style={[
+                  styles.menuItem,
+                  view === item.key && styles.menuItemActive,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.menuItemText,
+                    view === item.key && styles.menuItemTextActive,
+                  ]}
+                >
+                  {item.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      </Modal>
 
       {error ? <Text accessibilityRole="alert" style={styles.errorText}>{error}</Text> : null}
       {notice ? <Text style={styles.noticeText}>{notice}</Text> : null}
 
+      <View style={styles.metricsRow}>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>
+            {isBusiness ? 'סה״כ רכישות' : 'סה״כ מכירות'}
+          </Text>
+          <Text style={styles.metricValue}>{amount(purchaseSummary.totalAmount)}</Text>
+        </View>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>שולם</Text>
+          <Text style={styles.metricValue}>{amount(purchaseSummary.paidAmount)}</Text>
+        </View>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>
+            {isBusiness ? 'יתרה פתוחה' : 'יתרה לגבייה'}
+          </Text>
+          <Text style={styles.metricValue}>{amount(purchaseSummary.openAmount)}</Text>
+        </View>
+      </View>
+
       {view === 'profile' ? (
         <ProfileSettings
           user={user}
-          onProfileUpdated={(businessName) => onProfileUpdated(businessName)}
+          onProfileUpdated={onProfileUpdated}
         />
+      ) : null}
+
+      {view === 'security' ? (
+        <View style={styles.loginMethodPanel}>
+          <Text style={styles.panelTitle}>התחברות מהירה</Text>
+          {Platform.OS === 'web' ? (
+            <>
+              <Text style={styles.formHint}>
+                הגדירו Passkey כדי להתחבר באמצעות Face ID, טביעת אצבע או אמצעי האימות של המכשיר.
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                disabled={saving}
+                onPress={registerPasskey}
+                style={[styles.outlineButton, saving && styles.disabledButton]}
+              >
+                <Text style={styles.outlineButtonText}>
+                  {saving ? 'מגדיר...' : 'הגדרת Passkey / Face ID'}
+                </Text>
+              </Pressable>
+            </>
+          ) : (
+            <>
+              <Text style={styles.formHint}>
+                ההתחברות הביומטרית נשמרת במכשיר הזה בלבד.
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                disabled={saving}
+                onPress={configureBiometricLogin}
+                style={[styles.outlineButton, saving && styles.disabledButton]}
+              >
+                <Text style={styles.outlineButtonText}>
+                  {saving
+                    ? 'מעדכן...'
+                    : biometricEnabled
+                      ? 'כיבוי התחברות ביומטרית'
+                      : 'הפעלת זיהוי פנים / טביעת אצבע'}
+                </Text>
+              </Pressable>
+            </>
+          )}
+        </View>
       ) : null}
 
       {view === 'supplier' ? (
@@ -809,112 +1073,105 @@ function Dashboard({ user, busy, onLogout, onProfileUpdated }) {
 
       {view === 'overview' ? (
         <>
-          <View style={styles.periodRow}>
-            {[
-              { key: 'today', label: 'היום' },
-              { key: '7d', label: 'שבוע' },
-              { key: '30d', label: 'חודש' },
-              { key: 'all', label: 'הכל' },
-            ].map((item) => (
+          <View style={styles.panel}>
+            <View style={styles.panelHeader}>
+              <Text style={styles.panelTitle}>
+                {isBusiness ? 'רכישות אחרונות' : 'מכירות אחרונות'}
+              </Text>
+              <Text style={styles.panelCount}>
+                {Math.min(purchases.length, 5)} מתוך {purchases.length} רשומות
+              </Text>
+            </View>
+            {purchaseList}
+            {isBusiness && partners.length ? (
+              <Text style={styles.dashboardHint}>
+                רשומים {partners.length} ספקים לחשבון.
+              </Text>
+            ) : null}
+          </View>
+          {isBusiness ? (
+            <Text style={styles.dashboardHint}>
+              הסקירה מציגה את סך הרכישות, התשלומים והיתרה הפתוחה של העסק.
+            </Text>
+          ) : (
+            <Text style={styles.dashboardHint}>
+              הסקירה מציגה עסקאות מול עסקים ואת היתרה שטרם נגבתה.
+            </Text>
+          )}
+        </>
+      ) : null}
+
+      {view === 'history' ? (
+        <View style={styles.historyContent}>
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>
+              {isBusiness ? 'היסטוריית רכישות' : 'היסטוריית מכירות'}
+            </Text>
+            <Text style={styles.cardSubtitle}>
+              {isBusiness
+                ? 'סינון הרכישות לפי תקופה.'
+                : 'סינון העסקאות מול הלקוחות לפי תקופה.'}
+            </Text>
+            <View style={styles.periodRow}>
+              {[
+                { key: 'today', label: 'היום' },
+                { key: '7d', label: 'שבוע' },
+                { key: '30d', label: 'חודש' },
+                { key: 'all', label: 'הכל' },
+              ].map((item) => (
+                <Pressable
+                  key={item.key}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: period === item.key }}
+                  onPress={() => setPeriod(item.key)}
+                  style={[styles.periodButton, period === item.key && styles.periodButtonActive]}
+                >
+                  <Text style={[styles.periodText, period === item.key && styles.periodTextActive]}>
+                    {item.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <View style={styles.customRange}>
+              <TextInput
+                accessibilityLabel="מתאריך"
+                onChangeText={setCustomFrom}
+                placeholder="מתאריך YYYY-MM-DD"
+                placeholderTextColor="#9AA8B5"
+                style={styles.dateInput}
+                textAlign="right"
+                value={customFrom}
+              />
+              <TextInput
+                accessibilityLabel="עד תאריך"
+                onChangeText={setCustomTo}
+                placeholder="עד תאריך YYYY-MM-DD"
+                placeholderTextColor="#9AA8B5"
+                style={styles.dateInput}
+                textAlign="right"
+                value={customTo}
+              />
               <Pressable
-                key={item.key}
                 accessibilityRole="button"
-                accessibilityState={{ selected: period === item.key }}
-                onPress={() => setPeriod(item.key)}
-                style={[styles.periodButton, period === item.key && styles.periodButtonActive]}
+                onPress={applyCustomRange}
+                style={[styles.periodButton, period === 'custom' && styles.periodButtonActive]}
               >
-                <Text style={[styles.periodText, period === item.key && styles.periodTextActive]}>
-                  {item.label}
+                <Text style={[styles.periodText, period === 'custom' && styles.periodTextActive]}>
+                  סינון
                 </Text>
               </Pressable>
-            ))}
-          </View>
-          <View style={styles.customRange}>
-            <TextInput
-              accessibilityLabel="מתאריך"
-              onChangeText={setCustomFrom}
-              placeholder="מתאריך YYYY-MM-DD"
-              placeholderTextColor="#9AA8B5"
-              style={styles.dateInput}
-              textAlign="right"
-              value={customFrom}
-            />
-            <TextInput
-              accessibilityLabel="עד תאריך"
-              onChangeText={setCustomTo}
-              placeholder="עד תאריך YYYY-MM-DD"
-              placeholderTextColor="#9AA8B5"
-              style={styles.dateInput}
-              textAlign="right"
-              value={customTo}
-            />
-            <Pressable
-              accessibilityRole="button"
-              onPress={applyCustomRange}
-              style={[styles.periodButton, period === 'custom' && styles.periodButtonActive]}
-            >
-              <Text style={[styles.periodText, period === 'custom' && styles.periodTextActive]}>סינון</Text>
-            </Pressable>
-          </View>
-          <View style={styles.metricsRow}>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>סה״כ רכישות</Text>
-              <Text style={styles.metricValue}>{amount(total)}</Text>
-            </View>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>שולם</Text>
-              <Text style={styles.metricValue}>{amount(paid)}</Text>
-            </View>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>יתרה פתוחה</Text>
-              <Text style={styles.metricValue}>{amount(unpaid)}</Text>
             </View>
           </View>
           <View style={styles.panel}>
             <View style={styles.panelHeader}>
-              <Text style={styles.panelTitle}>{isBusiness ? 'רכישות אחרונות' : 'פעילות לקוחות'}</Text>
-              <Text style={styles.panelCount}>{purchases.length} רשומות</Text>
-            </View>
-            {loading ? (
-              <ActivityIndicator color={colors.teal} style={styles.listLoader} />
-            ) : purchases.length ? purchases.map((purchase) => (
-              <View key={purchase._id} style={styles.purchaseRow}>
-                <View style={styles.purchaseSummary}>
-                  <Text style={styles.purchaseName}>{purchasePartnerName(purchase)}</Text>
-                  <Text style={styles.purchaseMeta}>
-                    {purchase.items.map((item) => item.name).join(', ')} · {new Date(purchase.createdAt).toLocaleDateString('he-IL')}
-                  </Text>
-                  <Text style={styles.purchaseMeta}>
-                    {purchase.paymentMethod === 'cash' ? 'חשבון פתוח' : purchase.paymentMethod === 'check' ? 'צ׳ק' : 'אשראי'}
-                    {' · '}
-                    {purchase.paymentStatus === 'paid' ? 'שולם' : purchase.paymentStatus === 'open' ? 'פתוח' : 'ממתין לתשלום'}
-                  </Text>
-                </View>
-                <View style={styles.purchaseAmount}>
-                  <Text style={styles.purchaseValue}>{amount(purchase.totalAmount)}</Text>
-                  {isBusiness && purchase.paymentStatus !== 'paid' ? (
-                    <Pressable
-                      accessibilityRole="button"
-                      disabled={saving}
-                      onPress={() => markPaid(purchase._id)}
-                    >
-                      <Text style={styles.markPaidText}>סימון כשולם</Text>
-                    </Pressable>
-                  ) : null}
-                </View>
-              </View>
-            )) : (
-              <Text style={styles.emptyState}>
-                {isBusiness ? 'עדיין אין רכישות בתקופה הזו. אפשר להוסיף ספק ולרשום רכישה ראשונה.' : 'עדיין לא נרשמו רכישות מול החשבון שלך.'}
+              <Text style={styles.panelTitle}>
+                {isBusiness ? 'רכישות בתקופה' : 'עסקאות בתקופה'}
               </Text>
-            )}
+              <Text style={styles.panelCount}>{historyPurchases.length} רשומות</Text>
+            </View>
+            {purchaseList}
           </View>
-          {isBusiness && partners.length ? (
-            <Text style={styles.dashboardHint}>
-              רשומים {partners.length} ספקים לחשבון. אפשר להוסיף רכישות ולהפיק סיכום לפי תקופה.
-            </Text>
-          ) : null}
-        </>
+        </View>
       ) : null}
     </View>
   );
@@ -935,6 +1192,7 @@ export default function App() {
     role: 'business',
   });
   const [user, setUser] = useState(null);
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [booting, setBooting] = useState(true);
   const [error, setError] = useState('');
@@ -946,6 +1204,11 @@ export default function App() {
 
     async function restoreSession() {
       try {
+        const useBiometricLogin = await isBiometricLoginEnabled();
+        if (active && useBiometricLogin) {
+          setBiometricEnabled(true);
+          return;
+        }
         if (!(await hasAccessToken())) {
           return;
         }
@@ -1042,12 +1305,69 @@ export default function App() {
     }
   }
 
+  async function loginWithBiometric() {
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      const authenticated = await authenticateBiometricLogin();
+      if (!authenticated) {
+        setNotice('ההתחברות בוטלה. אפשר לנסות שוב או להתחבר עם שם משתמש וסיסמה.');
+        return;
+      }
+      const result = await apiRequest('/auth/me');
+      setUser(result.user);
+    } catch (requestError) {
+      if (requestError.status === 401) {
+        await clearAccessToken();
+        setBiometricEnabled(false);
+      }
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loginWithPasskey() {
+    const identifier = form.identifier.trim();
+    if (!identifier) {
+      setError('יש להזין שם משתמש או דוא״ל לפני ההתחברות עם Passkey.');
+      return;
+    }
+
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      const options = await apiRequest('/auth/passkey/login/options', {
+        method: 'POST',
+        body: JSON.stringify({ identifier }),
+      });
+      const { startAuthentication } = await import('@simplewebauthn/browser');
+      const response = await startAuthentication({ optionsJSON: options });
+      const result = await apiRequest('/auth/passkey/login/verify', {
+        method: 'POST',
+        body: JSON.stringify({ identifier, response }),
+      });
+      setUser(result.user);
+    } catch (requestError) {
+      setError(
+        requestError.name === 'NotAllowedError'
+          ? 'ההתחברות עם Passkey בוטלה או לא הושלמה.'
+          : requestError.message,
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function logout() {
     setError('');
     setBusy(true);
     try {
       await apiRequest('/auth/logout', { method: 'POST' });
       await clearAccessToken();
+      setBiometricEnabled(false);
       setUser(null);
       changeMode('login');
       setNotice('התנתקת בהצלחה.');
@@ -1058,8 +1378,8 @@ export default function App() {
     }
   }
 
-  function updateProfileBusinessName(businessName) {
-    setUser((current) => current ? { ...current, businessName } : current);
+  function updateUserProfile(profileUpdates) {
+    setUser((current) => current ? { ...current, ...profileUpdates } : current);
   }
 
   if (booting) {
@@ -1082,8 +1402,10 @@ export default function App() {
               <Dashboard
                 user={user}
                 busy={busy}
+                biometricEnabled={biometricEnabled}
+                onBiometricLoginChanged={setBiometricEnabled}
                 onLogout={logout}
-                onProfileUpdated={updateProfileBusinessName}
+                onProfileUpdated={updateUserProfile}
               />
             ) : (
               <>
@@ -1196,6 +1518,34 @@ export default function App() {
                   ) : null}
                   {notice ? <Text style={styles.noticeText}>{notice}</Text> : null}
 
+                  {mode === 'login' && biometricEnabled ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={busy}
+                      onPress={loginWithBiometric}
+                      style={[styles.outlineButton, busy && styles.disabledButton]}
+                    >
+                      <Text style={styles.outlineButtonText}>
+                        {busy ? 'מתחבר...' : 'כניסה באמצעות זיהוי פנים / טביעת אצבע'}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+
+                  {mode === 'login' && Platform.OS === 'web' &&
+                  typeof window !== 'undefined' &&
+                  typeof window.PublicKeyCredential !== 'undefined' ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={busy}
+                      onPress={loginWithPasskey}
+                      style={[styles.outlineButton, busy && styles.disabledButton]}
+                    >
+                      <Text style={styles.outlineButtonText}>
+                        {busy ? 'מתחבר...' : 'כניסה עם Passkey / זיהוי המכשיר'}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+
                   <Pressable
                     accessibilityRole="button"
                     disabled={busy}
@@ -1237,14 +1587,31 @@ const styles = StyleSheet.create({
   mobileContent: { flexDirection: 'column', gap: 18, width: '100%' },
   dashboard: { width: '100%', gap: 18 },
   dashboardHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: colors.navy, borderRadius: 20, paddingHorizontal: 22, paddingVertical: 20 },
+  dashboardIdentity: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, flex: 1 },
+  dashboardGreetingBlock: { alignItems: 'flex-end' },
   dashboardGreeting: { color: colors.white, fontSize: 20, fontWeight: '800', textAlign: 'right' },
   dashboardBusiness: { color: '#B7C9D3', fontSize: 13, marginTop: 5, textAlign: 'right' },
+  dashboardAvatar: { width: 52, height: 52, borderRadius: 26, overflow: 'hidden', backgroundColor: '#DDF7F2', alignItems: 'center', justifyContent: 'center' },
+  dashboardAvatarImage: { width: '100%', height: '100%' },
+  dashboardAvatarFallback: { color: colors.navy, fontSize: 21, fontWeight: '800' },
+  dashboardHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   logoutText: { color: '#C6D7DE', fontSize: 13, fontWeight: '700', padding: 8 },
-  dashboardNav: { flexDirection: 'row-reverse', gap: 8, flexWrap: 'wrap' },
-  dashboardNavItem: { minHeight: 40, justifyContent: 'center', paddingHorizontal: 16, borderRadius: 12, backgroundColor: '#E8EEF1' },
-  dashboardNavItemActive: { backgroundColor: colors.navy },
-  dashboardNavText: { color: colors.muted, fontSize: 13, fontWeight: '700' },
-  dashboardNavTextActive: { color: colors.white },
+  menuButton: { width: 42, height: 42, borderRadius: 13, backgroundColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
+  menuButtonIcon: { color: colors.white, fontSize: 22, fontWeight: '700' },
+  menuOverlay: { flex: 1, backgroundColor: 'transparent' },
+  menuScrim: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, backgroundColor: 'rgba(9,27,42,0.5)' },
+  menuDrawer: { position: 'absolute', top: 0, right: 0, bottom: 0, width: '82%', maxWidth: 360, backgroundColor: colors.white, padding: 22, paddingTop: Platform.OS === 'web' ? 28 : 52, gap: 8, elevation: 12 },
+  menuHeader: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  menuTitle: { color: colors.navy, fontSize: 21, fontWeight: '800', textAlign: 'right' },
+  menuCloseButton: { width: 38, height: 38, borderRadius: 12, backgroundColor: '#F2F6F8', alignItems: 'center', justifyContent: 'center' },
+  menuCloseText: { color: colors.navy, fontSize: 26, lineHeight: 30 },
+  menuAccountName: { color: colors.muted, fontSize: 12, fontWeight: '700', textAlign: 'right', paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: colors.border, marginBottom: 5 },
+  menuItem: { minHeight: 48, borderRadius: 12, paddingHorizontal: 14, justifyContent: 'center' },
+  menuItemActive: { backgroundColor: '#E9FAF7' },
+  menuItemText: { color: colors.ink, fontSize: 14, fontWeight: '600', textAlign: 'right' },
+  menuItemTextActive: { color: '#087B6D', fontWeight: '800' },
+  loginMethodPanel: { alignItems: 'flex-end', gap: 8, backgroundColor: colors.white, borderRadius: 16, borderWidth: 1, borderColor: '#E6EDF1', padding: 22 },
+  historyContent: { width: '100%', gap: 16 },
   panel: { backgroundColor: colors.white, borderRadius: 20, borderWidth: 1, borderColor: '#E6EDF1', padding: 22, shadowColor: '#20394B', shadowOpacity: 0.04, shadowRadius: 18, shadowOffset: { width: 0, height: 7 }, elevation: 2 },
   panelTitle: { color: colors.ink, fontSize: 17, fontWeight: '800', textAlign: 'right' },
   panelHeader: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },

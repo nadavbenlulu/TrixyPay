@@ -886,7 +886,7 @@ function Dashboard({
           {Platform.OS === 'web' ? (
             <>
               <Text style={styles.formHint}>
-                הגדירו Passkey כדי להתחבר באמצעות Face ID, טביעת אצבע או אמצעי האימות של המכשיר.
+                הגדירו Passkey פעם אחת כדי להתחבר באמצעות Face ID או אמצעי האימות של המכשיר, בלי להקליד שם משתמש.
               </Text>
               <Pressable
                 accessibilityRole="button"
@@ -1330,30 +1330,27 @@ export default function App() {
 
   async function loginWithPasskey() {
     const identifier = form.identifier.trim();
-    if (!identifier) {
-      setError('יש להזין שם משתמש או דוא״ל לפני ההתחברות עם Passkey.');
-      return;
-    }
-
     setError('');
     setNotice('');
     setBusy(true);
     try {
       const options = await apiRequest('/auth/passkey/login/options', {
         method: 'POST',
-        body: JSON.stringify({ identifier }),
+        body: JSON.stringify(identifier ? { identifier } : {}),
       });
       const { startAuthentication } = await import('@simplewebauthn/browser');
       const response = await startAuthentication({ optionsJSON: options });
       const result = await apiRequest('/auth/passkey/login/verify', {
         method: 'POST',
-        body: JSON.stringify({ identifier, response }),
+        body: JSON.stringify(identifier ? { identifier, response } : { response }),
       });
       setUser(result.user);
     } catch (requestError) {
       setError(
         requestError.name === 'NotAllowedError'
-          ? 'ההתחברות עם Passkey בוטלה או לא הושלמה.'
+          ? identifier
+            ? 'ההתחברות עם Passkey בוטלה או לא הושלמה.'
+            : 'לא נבחר Passkey. אם זו הפעם הראשונה, יש להתחבר עם סיסמה ולהגדיר Passkey בתפריט ״התחברות ואבטחה״.'
           : requestError.message,
       );
     } finally {
@@ -1587,7 +1584,7 @@ const styles = StyleSheet.create({
   mobileContent: { flexDirection: 'column', gap: 18, width: '100%' },
   dashboard: { width: '100%', gap: 18 },
   dashboardHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: colors.navy, borderRadius: 20, paddingHorizontal: 22, paddingVertical: 20 },
-  dashboardIdentity: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, flex: 1 },
+  dashboardIdentity: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
   dashboardGreetingBlock: { alignItems: 'flex-end' },
   dashboardGreeting: { color: colors.white, fontSize: 20, fontWeight: '800', textAlign: 'right' },
   dashboardBusiness: { color: '#B7C9D3', fontSize: 13, marginTop: 5, textAlign: 'right' },
